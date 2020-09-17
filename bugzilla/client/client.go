@@ -6,11 +6,13 @@ package client
 
 import (
 	"bytes"
+	"context"
+	"crypto/tls"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io/ioutil"
 	"net/http"
+	"net/http/httptrace"
 	"regexp"
 	"strconv"
 	"strings"
@@ -23,6 +25,8 @@ import (
 
 	"github.com/mozilla/OneCRL-Tools/bugzilla/api/auth"
 	"github.com/mozilla/OneCRL-Tools/bugzilla/api/bugs"
+
+	log "github.com/sirupsen/logrus"
 )
 
 type Client struct {
@@ -41,12 +45,16 @@ type Client struct {
 // every constructed client.
 func NewClient(host string) *Client {
 	host = strings.TrimRight(host, "/")
+	tr := &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+	}
 	return &Client{
 		host:          host,
 		base:          host + "/rest",
 		authenticator: new(auth.Unauthenticated),
-		inner:         new(http.Client),
-		tool:          "https://github.com/mozilla/OneCRL-Tools/bugzilla",
+		inner:         &http.Client{Transport: tr},
+		// inner:         new(http.Client),
+		tool: "https://github.com/mozilla/OneCRL-Tools/bugzilla",
 	}
 }
 
@@ -116,6 +124,7 @@ func (c *Client) do(in api.Endpoint, out interface{}) error {
 	if err != nil {
 		return err
 	}
+
 	resp, err := c.inner.Do(req)
 	if err != nil {
 		return err
@@ -126,23 +135,41 @@ func (c *Client) do(in api.Endpoint, out interface{}) error {
 		return err
 	}
 	if resp.StatusCode != in.Expect() {
-		return errors.New(string(b))
+		return fmt.Errorf("Status: %d, Body: %s", resp.StatusCode, string(b))
 	}
 	return json.Unmarshal(b, out)
 }
 
 func (c *Client) newRequest(endpoint api.Endpoint) (*http.Request, error) {
+	ctx := context.Background()
+	if log.IsLevelEnabled(log.TraceLevel) {
+		tracer := &httptrace.ClientTrace{
+			WroteHeaderField: func(key string, value []string) {
+				log.WithField(key, fmt.Sprintf("%v", value)).
+					WithField("resource", c.base+endpoint.Resource()).Trace("Header")
+			},
+			WroteRequest: func(wr httptrace.WroteRequestInfo) {
+				log.WithField("request", fmt.Sprintf("%v", wr)).
+					WithField("resource", c.base+endpoint.Resource()).Trace("Request")
+			},
+		}
+		ctx = httptrace.WithClientTrace(ctx, tracer)
+	}
+
 	req, err := http.NewRequest(endpoint.Method(), c.base+endpoint.Resource(), nil)
 	if err != nil {
 		return nil, err
 	}
+
 	if endpoint.Method() != http.MethodGet {
 		b, err := json.Marshal(endpoint)
 		if err != nil {
 			return nil, err
 		}
 		req.Body = ioutil.NopCloser(bytes.NewReader(b))
+		req.ContentLength = int64(len(b))
 	}
+
 	req.Header.Set("X-AUTOMATED-TOOL", c.tool)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
